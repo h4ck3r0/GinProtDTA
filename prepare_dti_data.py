@@ -106,14 +106,14 @@ def save_protbert_cache(cache):
     torch.save(cache, CACHE_PATH)
     print(f"Saved ProtBERT cache with {len(cache)} entries.")
 
-def process_dataset(df, protbert_cache, log_file):
+def process_dataset(df, protbert_cache, log_file, label_col="pKd"):
     data_list = []
     skipped = 0
     with open(log_file, "w") as flog:
         for idx, row in tqdm(df.iterrows(), total=len(df)):
             smiles = row["compound_iso_smiles"]
             seq = row["target_sequence"]
-            pkd = row["pKd"]
+            label = row[label_col]
             try:
                 graph = smiles_to_graph(smiles)
                 if graph is None:
@@ -134,9 +134,9 @@ def process_dataset(df, protbert_cache, log_file):
                 skipped += 1
                 continue
             try:
-                y = torch.tensor([float(pkd)], dtype=torch.float)
+                y = torch.tensor([float(label)], dtype=torch.float)
             except Exception as e:
-                flog.write(f"pKd error at idx {idx}: {pkd} | {e}\n")
+                flog.write(f"Label error at idx {idx}: {label} | {e}\n")
                 skipped += 1
                 continue
             data = Data(
@@ -165,23 +165,45 @@ def main():
     train_df, test_df = split_bindingdb(bindingdb)
     # Collect unique sequences
     unique_seqs = collect_unique_sequences([train_df, test_df, davis])
-    protbert_cache = load_protbert_cache()
+
+    # ProtBERT cache
+    protbert_cache_exists = os.path.exists("processed/protbert_cache.pt")
+    if protbert_cache_exists:
+        protbert_cache = load_protbert_cache()
+    else:
+        protbert_cache = {}
+
     uncached_seqs = [seq for seq in unique_seqs if seq not in protbert_cache]
     if uncached_seqs:
         print(f"Computing embeddings for {len(uncached_seqs)} new protein sequences...")
         new_embs = batch_protbert_embeddings(uncached_seqs, batch_size=BATCH_SIZE)
         protbert_cache.update(new_embs)
         save_protbert_cache(protbert_cache)
-    # Process datasets
-    print("Processing BindingDB train set...")
-    train_data = process_dataset(train_df, protbert_cache, "processed/bindingdb_train.log")
-    torch.save(train_data, "processed/bindingdb_train.pt")
-    print("Processing BindingDB test set...")
-    test_data = process_dataset(test_df, protbert_cache, "processed/bindingdb_test.log")
-    torch.save(test_data, "processed/bindingdb_test.pt")
-    print("Processing Davis...")
-    davis_data = process_dataset(davis, protbert_cache, "processed/davis.log")
-    torch.save(davis_data, "processed/davis.pt")
+    else:
+        print("All protein embeddings are already cached.")
+
+    # Process datasets with skip logic
+    if os.path.exists("processed/bindingdb_train.pt"):
+        print("bindingdb_train.pt already exists, skipping.")
+    else:
+        print("Processing BindingDB train set...")
+        train_data = process_dataset(train_df, protbert_cache, "processed/bindingdb_train.log", label_col="pKd")
+        torch.save(train_data, "processed/bindingdb_train.pt")
+
+    if os.path.exists("processed/bindingdb_test.pt"):
+        print("bindingdb_test.pt already exists, skipping.")
+    else:
+        print("Processing BindingDB test set...")
+        test_data = process_dataset(test_df, protbert_cache, "processed/bindingdb_test.log", label_col="pKd")
+        torch.save(test_data, "processed/bindingdb_test.pt")
+
+    if os.path.exists("processed/davis.pt"):
+        print("davis.pt already exists, skipping.")
+    else:
+        print("Processing Davis...")
+        davis_data = process_dataset(davis, protbert_cache, "processed/davis.log", label_col="affinity")
+        torch.save(davis_data, "processed/davis.pt")
+
     print("All datasets processed and saved in ./processed/")
 
 if __name__ == "__main__":
