@@ -17,26 +17,55 @@ PROTBERT_MODEL = "Rostlab/prot_bert"
 CACHE_PATH = "processed/protbert_cache.pt"
 BATCH_SIZE = 16
 
-tokenizer = BertTokenizer.from_pretrained(PROTBERT_MODEL, do_lower_case=False)
-protbert = BertModel.from_pretrained(PROTBERT_MODEL)
+tokenizer = BertTokenizer.from_pretrained(PROTBERT_MODEL, do_lower_case=False, local_files_only=True)
+protbert = BertModel.from_pretrained(PROTBERT_MODEL, local_files_only=True)
 protbert.eval()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 protbert = protbert.to(device)
+
+def one_of_k_encoding(x, allowable_set):
+    if x not in allowable_set:
+        raise Exception("input {0} not in allowable set{1}:".format(x, allowable_set))
+    return list(map(lambda s: x == s, allowable_set))
+
+def one_of_k_encoding_unk(x, allowable_set):
+    """Maps inputs not in the allowable set to the last element."""
+    if x not in allowable_set:
+        x = allowable_set[-1]
+    return list(map(lambda s: x == s, allowable_set))
+
+def atom_features(atom):
+    # GraphDTA-style atom features (one-hot + aromaticity)
+    return np.array(
+        one_of_k_encoding_unk(atom.GetSymbol(), [
+            'C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg', 'Na', 'Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl', 'Yb',
+            'Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H', 'Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr', 'Cr', 'Pt', 'Hg', 'Pb', 'Unknown'
+        ]) +
+        one_of_k_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) +
+        one_of_k_encoding_unk(atom.GetTotalNumHs(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) +
+        one_of_k_encoding_unk(atom.GetImplicitValence(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) +
+        [atom.GetIsAromatic()]
+    )
+
+def bond_features(bond):
+    # GraphDTA-style edge features (one-hot for bond type, conjugation, ring)
+    bt = bond.GetBondType()
+    bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC]
+    bond_type_enc = one_of_k_encoding_unk(bt, bond_types)
+    return np.array(
+        bond_type_enc +
+        [bond.GetIsConjugated()] +
+        [bond.IsInRing()]
+    )
 
 def smiles_to_graph(smiles):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    atom_features = []
+    atom_features_list = []
     for atom in mol.GetAtoms():
-        atom_features.append([
-            atom.GetAtomicNum(),
-            atom.GetDegree(),
-            atom.GetTotalNumHs(),
-            atom.GetImplicitValence(),
-            int(atom.GetIsAromatic()),
-        ])
-    x = torch.tensor(atom_features, dtype=torch.float)
+        atom_features_list.append(atom_features(atom))
+    x = torch.tensor(np.array(atom_features_list), dtype=torch.float)
     edge_index = []
     edge_attr = []
     for bond in mol.GetBonds():
@@ -44,22 +73,15 @@ def smiles_to_graph(smiles):
         j = bond.GetEndAtomIdx()
         edge_index.append([i, j])
         edge_index.append([j, i])
-        edge_attr.append([
-            int(bond.GetBondTypeAsDouble()),
-            int(bond.GetIsConjugated()),
-            int(bond.IsInRing())
-        ])
-        edge_attr.append([
-            int(bond.GetBondTypeAsDouble()),
-            int(bond.GetIsConjugated()),
-            int(bond.IsInRing())
-        ])
+        bf = bond_features(bond)
+        edge_attr.append(bf)
+        edge_attr.append(bf)
     if len(edge_index) == 0:
         edge_index = torch.empty((2, 0), dtype=torch.long)
-        edge_attr = torch.empty((0, 3), dtype=torch.float)
+        edge_attr = torch.empty((0, 6), dtype=torch.float)
     else:
         edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+        edge_attr = torch.tensor(np.array(edge_attr), dtype=torch.float)
     return x, edge_index, edge_attr
 
 def collect_unique_sequences(dfs):
@@ -134,7 +156,13 @@ def process_dataset(df, protbert_cache, log_file, label_col="pKd"):
                 skipped += 1
                 continue
             try:
-                y = torch.tensor([float(label)], dtype=torch.float)
+                # Skip if label is NaN or not finite
+                if pd.isna(label) or not np.isfinite(label):
+                    flog.write(f"Label error at idx {idx}: {label} | Not finite\n")
+                    skipped += 1
+                    continue
+                label = float(label)
+                y = torch.tensor([label], dtype=torch.float)
             except Exception as e:
                 flog.write(f"Label error at idx {idx}: {label} | {e}\n")
                 skipped += 1
@@ -160,11 +188,13 @@ def split_bindingdb(df):
 def main():
     os.makedirs("processed", exist_ok=True)
     # Load datasets
-    bindingdb = pd.read_csv(os.path.join("data", "bindingdb.csv"))
+    bindingdb = pd.read_csv(os.path.join("data", "bindingdb_highconf_pKd_sample.csv"))
     davis = pd.read_csv(os.path.join("data", "davis.csv"))
     train_df, test_df = split_bindingdb(bindingdb)
     # Collect unique sequences
     unique_seqs = collect_unique_sequences([train_df, test_df, davis])
+
+    # No normalization of affinity
 
     # ProtBERT cache
     protbert_cache_exists = os.path.exists("processed/protbert_cache.pt")
@@ -182,19 +212,19 @@ def main():
     else:
         print("All protein embeddings are already cached.")
 
-    # Process datasets with skip logic
+    # Process datasets without normalization
     if os.path.exists("processed/bindingdb_train.pt"):
         print("bindingdb_train.pt already exists, skipping.")
     else:
         print("Processing BindingDB train set...")
-        train_data = process_dataset(train_df, protbert_cache, "processed/bindingdb_train.log", label_col="pKd")
+        train_data = process_dataset(train_df, protbert_cache, "processed/bindingdb_train.log", label_col="affinity")
         torch.save(train_data, "processed/bindingdb_train.pt")
 
     if os.path.exists("processed/bindingdb_test.pt"):
         print("bindingdb_test.pt already exists, skipping.")
     else:
         print("Processing BindingDB test set...")
-        test_data = process_dataset(test_df, protbert_cache, "processed/bindingdb_test.log", label_col="pKd")
+        test_data = process_dataset(test_df, protbert_cache, "processed/bindingdb_test.log", label_col="affinity")
         torch.save(test_data, "processed/bindingdb_test.pt")
 
     if os.path.exists("processed/davis.pt"):
