@@ -17,8 +17,8 @@ PROTBERT_MODEL = "Rostlab/prot_bert"
 CACHE_PATH = "processed/protbert_cache.pt"
 BATCH_SIZE = 16
 
-tokenizer = BertTokenizer.from_pretrained(PROTBERT_MODEL, do_lower_case=False, local_files_only=True)
-protbert = BertModel.from_pretrained(PROTBERT_MODEL, local_files_only=True)
+tokenizer = BertTokenizer.from_pretrained(PROTBERT_MODEL, do_lower_case=False)
+protbert = BertModel.from_pretrained(PROTBERT_MODEL)
 protbert.eval()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 protbert = protbert.to(device)
@@ -48,7 +48,6 @@ def atom_features(atom):
     )
 
 def bond_features(bond):
-    # GraphDTA-style edge features (one-hot for bond type, conjugation, ring)
     bt = bond.GetBondType()
     bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC]
     bond_type_enc = one_of_k_encoding_unk(bt, bond_types)
@@ -156,7 +155,6 @@ def process_dataset(df, protbert_cache, log_file, label_col="pKd"):
                 skipped += 1
                 continue
             try:
-                # Skip if label is NaN or not finite
                 if pd.isna(label) or not np.isfinite(label):
                     flog.write(f"Label error at idx {idx}: {label} | Not finite\n")
                     skipped += 1
@@ -187,16 +185,10 @@ def split_bindingdb(df):
 
 def main():
     os.makedirs("processed", exist_ok=True)
-    # Load datasets
     bindingdb = pd.read_csv(os.path.join("data", "bindingdb_highconf_pKd_sample.csv"))
     davis = pd.read_csv(os.path.join("data", "davis.csv"))
     train_df, test_df = split_bindingdb(bindingdb)
-    # Collect unique sequences
     unique_seqs = collect_unique_sequences([train_df, test_df, davis])
-
-    # No normalization of affinity
-
-    # ProtBERT cache
     protbert_cache_exists = os.path.exists("processed/protbert_cache.pt")
     if protbert_cache_exists:
         protbert_cache = load_protbert_cache()
@@ -212,7 +204,6 @@ def main():
     else:
         print("All protein embeddings are already cached.")
 
-    # Process datasets without normalization
     if os.path.exists("processed/bindingdb_train.pt"):
         print("bindingdb_train.pt already exists, skipping.")
     else:
