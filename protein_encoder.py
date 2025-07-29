@@ -1,37 +1,34 @@
 import torch
-from transformers import BertTokenizer, BertModel
+import torch.nn as nn
 
-class ProteinBERTEncoder(torch.nn.Module):
-    def __init__(self, model_name="Rostlab/prot_bert", device="cpu", finetune=True, fc_dim=512, dropout=0.1):
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+AA_TO_IDX = {aa: i+1 for i, aa in enumerate(AMINO_ACIDS)}  
+VOCAB_SIZE = len(AMINO_ACIDS) + 1  
+
+class ProteinBiLSTMEncoder(nn.Module):
+    def __init__(self, embedding_dim=128, hidden_dim=1024, num_layers=3, fc_dim=512, dropout=0.3):
         super().__init__()
-        self.tokenizer = BertTokenizer.from_pretrained(model_name, do_lower_case=False)
-        self.bert = BertModel.from_pretrained(model_name)
-        self.bert.to(device)
-        self.finetune = finetune
-        self.device = device
-        self.dropout = torch.nn.Dropout(dropout)
-        self.fc = torch.nn.Sequential(
-            torch.nn.Linear(self.bert.config.hidden_size, fc_dim),
-            torch.nn.ReLU(),
-            torch.nn.Dropout(dropout),
-            torch.nn.Linear(fc_dim, self.bert.config.hidden_size)
-        )
-        # Set requires_grad according to finetune flag
-        for param in self.bert.parameters():
-            param.requires_grad = finetune
+        self.embedding = nn.Embedding(VOCAB_SIZE, embedding_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True, bidirectional=True, dropout=dropout)
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2)
+        self.fc = nn.Linear(hidden_dim * 2, fc_dim)
+        self.output_dim = fc_dim
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, seqs):
-        spaced = [" ".join(list(seq)) for seq in seqs]
-        tokens = self.tokenizer(
-            spaced,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=1024
-        )
-        tokens = {k: v.to(self.device) for k, v in tokens.items()}
-        out = self.bert(**tokens)
-        emb = out.last_hidden_state[:, 0, :]
-        emb = self.dropout(emb)
-        emb = self.fc(emb)
-        return emb
+      
+        max_len = max(len(seq) for seq in seqs)
+        idxs = []
+        for seq in seqs:
+            idx_seq = [AA_TO_IDX.get(aa, 0) for aa in seq]
+            idxs.append(idx_seq + [0] * (max_len - len(idx_seq)))
+        idxs = torch.tensor(idxs, dtype=torch.long, device=next(self.parameters()).device)
+        emb = self.embedding(idxs)
+        out, _ = self.lstm(emb)
+        mask = (idxs != 0).float().unsqueeze(-1)
+        summed = (out * mask).sum(dim=1)
+        counts = mask.sum(dim=1).clamp(min=1)
+        pooled = summed / counts
+        normed = self.layer_norm(pooled)
+        fc_out = self.fc(normed)
+        return self.dropout(fc_out)
